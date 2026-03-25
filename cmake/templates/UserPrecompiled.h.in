@@ -31,6 +31,8 @@
     // context->setAddress2Precompiled(Address(0x5001),
     // std::make_shared<dev::precompiled::HelloWorldPrecompiled>());
     context->setAddress2Precompiled(
+        Address(dev::precompiled::CHAIN_API_ADDRESS), std::make_shared<dev::precompiled::ChainAPIPrecompiled>());
+    context->setAddress2Precompiled(
         Address(dev::precompiled::DAG_TRANSFER_ADDRESS), std::make_shared<dev::precompiled::DagTransferPrecompiled>());
     context->setAddress2Precompiled(
         Address(dev::precompiled::PAILLIER_ADDRESS), std::make_shared<dev::precompiled::PaillierPrecompiled>());
