@@ -220,6 +220,7 @@ const Address KVTABLE_FACTORY_ADDRESS = Address(0x1010);
 const Address WORKING_SEALER_MGR_ADDRESS = Address(0x1011);
 
 // crypto/extension precompiled contract address
+const Address CHAIN_API_ADDRESS = Address(0x5001);
 const Address DAG_TRANSFER_ADDRESS = Address(0x5002);
 const Address PAILLIER_ADDRESS = Address(0x5003);
 const Address GROUP_SIG_ADDRESS = Address(0x5004);
