@@ -6,6 +6,8 @@
 class CallVendorHE
 {
 public:
+    struct Impl;
+
     enum class Err
     {
         OK = 0,
@@ -48,6 +50,5 @@ public:
     Err length(const std::string& data, std::string& out) const;
 
 private:
-    struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

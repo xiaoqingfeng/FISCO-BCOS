@@ -1,9 +1,58 @@
 #include "CallVendorHE.h"
+#include <boost/algorithm/string.hpp>
 #include <dlfcn.h>
+#include <libprecompiled/Common.h>
+#include <cstdlib>
 #include <mutex>
 
 namespace
 {
+enum ChainAPILogLevel
+{
+    LOG_LEVEL_TRACE = 0,
+    LOG_LEVEL_DEBUG = 1,
+    LOG_LEVEL_INFO = 2,
+    LOG_LEVEL_WARNING = 3,
+    LOG_LEVEL_ERROR = 4
+};
+
+ChainAPILogLevel chainAPILogLevel()
+{
+    static ChainAPILogLevel s_level = []() {
+        const char* configured = std::getenv("CHAIN_API_PRECOMPILED_LOG_LEVEL");
+        if (!configured)
+        {
+            return LOG_LEVEL_DEBUG;
+        }
+        std::string level = configured;
+        boost::to_upper(level);
+        if (level == "TRACE")
+        {
+            return LOG_LEVEL_TRACE;
+        }
+        if (level == "DEBUG")
+        {
+            return LOG_LEVEL_DEBUG;
+        }
+        if (level == "INFO")
+        {
+            return LOG_LEVEL_INFO;
+        }
+        if (level == "WARNING" || level == "WARN")
+        {
+            return LOG_LEVEL_WARNING;
+        }
+        if (level == "ERROR")
+        {
+            return LOG_LEVEL_ERROR;
+        }
+        return LOG_LEVEL_DEBUG;
+    }();
+    return s_level;
+}
+
+inline bool shouldLog(ChainAPILogLevel _expected) { return _expected >= chainAPILogLevel(); }
+
 template <typename T>
 T loadSym(void* handle, const char* name)
 {
@@ -78,6 +127,12 @@ CallVendorHE::~CallVendorHE()
 CallVendorHE::Err CallVendorHE::initSo(const std::string& soPath)
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_INFO))
+    {
+        PRECOMPILED_LOG(INFO) << LOG_BADGE("CallVendorHE") << LOG_DESC("initSo")
+                              << LOG_KV("soPath", soPath)
+                              << LOG_KV("defaultLogLevel", "DEBUG");
+    }
 
     if (m_impl->soHandle)
     {
@@ -89,6 +144,8 @@ CallVendorHE::Err CallVendorHE::initSo(const std::string& soPath)
     m_impl->soHandle = dlopen(soPath.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!m_impl->soHandle)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("dlopen failed")
+                               << LOG_KV("soPath", soPath);
         return Err::SO_LOAD_FAIL;
     }
 
@@ -123,9 +180,14 @@ CallVendorHE::Err CallVendorHE::initSo(const std::string& soPath)
         !m_impl->addDouble || !m_impl->subDouble || !m_impl->mulDouble || !m_impl->divDouble ||
         !m_impl->cmpDouble || !m_impl->concatString || !m_impl->substring || !m_impl->length)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("dlsym incomplete");
         return Err::SYM_LOAD_FAIL;
     }
 
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("initSo success");
+    }
     return Err::OK;
 }
 
@@ -134,6 +196,7 @@ CallVendorHE::Err CallVendorHE::setFilePath(const std::string& path)
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->soHandle || !m_impl->setPath)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("setFilePath not init");
         return Err::NOT_INIT;
     }
     if (path.empty())
@@ -142,9 +205,16 @@ CallVendorHE::Err CallVendorHE::setFilePath(const std::string& path)
     }
     if (m_impl->setPath(path.c_str()) != 0)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("set path failed")
+                               << LOG_KV("path", path);
         return Err::IO_FAIL;
     }
     m_impl->basePath = path;
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("setFilePath done")
+                               << LOG_KV("path", path);
+    }
     return Err::OK;
 }
 
@@ -153,13 +223,20 @@ CallVendorHE::Err CallVendorHE::loadSK(const std::string& filename)
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->soHandle || !m_impl->loadSK)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadSK not init");
         return Err::NOT_INIT;
     }
     if (filename.empty())
     {
         return Err::BAD_PARAM;
     }
-    return mapRet(m_impl->loadSK((m_impl->basePath + filename).c_str()));
+    auto ret = mapRet(m_impl->loadSK((m_impl->basePath + filename).c_str()));
+    if (ret != Err::OK)
+    {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadSK failed")
+                               << LOG_KV("file", filename);
+    }
+    return ret;
 }
 
 CallVendorHE::Err CallVendorHE::loadPK(const std::string& filename)
@@ -167,13 +244,20 @@ CallVendorHE::Err CallVendorHE::loadPK(const std::string& filename)
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->soHandle || !m_impl->loadPK)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadPK not init");
         return Err::NOT_INIT;
     }
     if (filename.empty())
     {
         return Err::BAD_PARAM;
     }
-    return mapRet(m_impl->loadPK((m_impl->basePath + filename).c_str()));
+    auto ret = mapRet(m_impl->loadPK((m_impl->basePath + filename).c_str()));
+    if (ret != Err::OK)
+    {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadPK failed")
+                               << LOG_KV("file", filename);
+    }
+    return ret;
 }
 
 CallVendorHE::Err CallVendorHE::loadDictionary(const std::string& filename)
@@ -181,6 +265,7 @@ CallVendorHE::Err CallVendorHE::loadDictionary(const std::string& filename)
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->soHandle || !m_impl->loadDict)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadDictionary not init");
         return Err::NOT_INIT;
     }
     if (filename.empty())
@@ -189,6 +274,11 @@ CallVendorHE::Err CallVendorHE::loadDictionary(const std::string& filename)
     }
     auto ret = mapRet(m_impl->loadDict((m_impl->basePath + filename).c_str()));
     m_impl->ready = (ret == Err::OK);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadDictionary")
+                               << LOG_KV("file", filename) << LOG_KV("ready", m_impl->ready);
+    }
     return ret;
 }
 
@@ -207,6 +297,7 @@ static CallVendorHE::Err call1(const CallVendorHE::Impl* impl,
     auto ret = mapRet(fn(input.c_str(), buf, sizeof(buf)));
     if (ret != CallVendorHE::Err::OK)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("call1 failed");
         return ret;
     }
     out = std::string(buf);
@@ -229,6 +320,7 @@ static CallVendorHE::Err call2(const CallVendorHE::Impl* impl,
     auto ret = mapRet(fn(a.c_str(), b.c_str(), buf, sizeof(buf)));
     if (ret != CallVendorHE::Err::OK)
     {
+        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("call2 failed");
         return ret;
     }
     out = std::string(buf);
@@ -238,84 +330,159 @@ static CallVendorHE::Err call2(const CallVendorHE::Impl* impl,
 CallVendorHE::Err CallVendorHE::encryptPubInt(const std::string& in, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("encryptPubInt")
+                               << LOG_KV("input", in);
+    }
     return call1(m_impl.get(), m_impl->encInt, in, out);
 }
 CallVendorHE::Err CallVendorHE::decryptInt(const std::string& in, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("decryptInt")
+                               << LOG_KV("input", in);
+    }
     return call1(m_impl.get(), m_impl->decInt, in, out);
 }
 CallVendorHE::Err CallVendorHE::encryptPubDouble(const std::string& in, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("encryptPubDouble")
+                               << LOG_KV("input", in);
+    }
     return call1(m_impl.get(), m_impl->encDouble, in, out);
 }
 CallVendorHE::Err CallVendorHE::decryptDouble(const std::string& in, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("decryptDouble")
+                               << LOG_KV("input", in);
+    }
     return call1(m_impl.get(), m_impl->decDouble, in, out);
 }
 CallVendorHE::Err CallVendorHE::encryptPubString(const std::string& in, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("encryptPubString")
+                               << LOG_KV("input", in);
+    }
     return call1(m_impl.get(), m_impl->encString, in, out);
 }
 CallVendorHE::Err CallVendorHE::decryptString(const std::string& in, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("decryptString")
+                               << LOG_KV("input", in);
+    }
     return call1(m_impl.get(), m_impl->decString, in, out);
 }
 CallVendorHE::Err CallVendorHE::length(const std::string& data, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("length")
+                               << LOG_KV("input", data);
+    }
     return call1(m_impl.get(), m_impl->length, data, out);
 }
 
 CallVendorHE::Err CallVendorHE::addInt(const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("addInt")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->addInt, a, b, out);
 }
 CallVendorHE::Err CallVendorHE::substractInt(
     const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("substractInt")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->subInt, a, b, out);
 }
 CallVendorHE::Err CallVendorHE::addDouble(
     const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("addDouble")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->addDouble, a, b, out);
 }
 CallVendorHE::Err CallVendorHE::substractDouble(
     const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("substractDouble")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->subDouble, a, b, out);
 }
 CallVendorHE::Err CallVendorHE::multiplyDouble(
     const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("multiplyDouble")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->mulDouble, a, b, out);
 }
 CallVendorHE::Err CallVendorHE::divideDouble(
     const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("divideDouble")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->divDouble, a, b, out);
 }
 CallVendorHE::Err CallVendorHE::compareDouble(
     const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("compareDouble")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->cmpDouble, a, b, out);
 }
 CallVendorHE::Err CallVendorHE::concatString(
     const std::string& a, const std::string& b, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("concatString")
+                               << LOG_KV("a", a) << LOG_KV("b", b);
+    }
     return call2(m_impl.get(), m_impl->concatString, a, b, out);
 }
 
@@ -323,6 +490,12 @@ CallVendorHE::Err CallVendorHE::substring(
     const std::string& data, const std::string& startIn, const std::string& endIn, std::string& out) const
 {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    if (shouldLog(LOG_LEVEL_DEBUG))
+    {
+        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("substring")
+                               << LOG_KV("data", data) << LOG_KV("start", startIn)
+                               << LOG_KV("end", endIn);
+    }
     if (!m_impl->soHandle || !m_impl->ready || !m_impl->substring)
     {
         return Err::NOT_INIT;
