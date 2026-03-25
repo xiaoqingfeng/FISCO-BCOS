@@ -143,7 +143,7 @@ ExternalProject_Add(cryptopp
         -DBUILD_SHARED=OFF
         -DBUILD_TESTING=OFF
         -DCMAKE_C_FLAGS='${MARCH_TYPE}'
-        -DCMAKE_CXX_FLAGS='${MARCH_TYPE}'
+        -DCMAKE_CXX_FLAGS='-std=c++11 ${MARCH_TYPE}'
         -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
         -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release
