@@ -1,0 +1,1152 @@
+From 3852b885ed02bc6bdfc6b142e6bd09a6fd168039 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Mar 2026 12:58:42 +0000
+Subject: [PATCH] Add ChainAPI precompiled with vendor HE bridge and adjust
+ dependency build flags
+
+### Motivation
+- Provide a ChainAPI precompiled contract backed by a vendor HE (homomorphic encryption) shared object bridge to expose vendor crypto functions inside precompiled contracts.
+- Ensure third-party dependencies (CryptoPP and RocksDB) are built with controlled C/C++ standards and PIC/threading flags for better portability and to allow static linkage into shared contexts.
+- Expose a new precompiled address for ChainAPI and wire it into the precompiled registration process.
+
+### Description
+- Added a vendor bridge `CallVendorHE` (`CallVendorHE.h/.cpp`) that loads a vendor SO with `dlopen` and exposes typed wrapper methods for encryption, arithmetic, substring/length ops and lifecycle operations.
+- Implemented `ChainAPIPrecompiled` (`ChainAPIPrecompiled.h/.cpp`) which maps ABI calls to the vendor bridge and returns ABI-encoded results and mapped error codes.
+- Introduced a new precompiled address constant `CHAIN_API_ADDRESS` in `libprecompiled/Common.h` and registered `ChainAPIPrecompiled` in `UserPrecompiled.h` template to enable the contract at runtime.
+- Updated `libprecompiled/CMakeLists.txt` to link `precompiled` with `${CMAKE_DL_LIBS}` and added the new `extension` sources under `libprecompiled/extension`.
+- Adjusted build flags for vendored dependencies: in `cmake/ProjectCryptopp.cmake` and `cmake/ProjectRocksDB.cmake` set explicit C/C++ standards (`C++11`, `C99`), required settings, and refined `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` to include `-fPIC`, `-pthread` and disable compiler extensions where appropriate.
+
+### Testing
+- Ran a full CMake configure and build (`cmake` + `cmake --build`) of the project with the updated build scripts and the `precompiled` target which completed successfully.
+- Built the static dependency artifacts (cryptopp, rocksdb) through the external project builds and confirmed the expected byproducts (`libcryptopp.a`, `librocksdb.a`) were produced.
+- Executed the available automated test target (`ctest` / `make test`) after the build and observed no failing tests.
+---
+ cmake/ProjectCryptopp.cmake                   |   7 +-
+ cmake/ProjectRocksDB.cmake                    |   9 +-
+ cmake/templates/UserPrecompiled.h.in          |   2 +
+ libprecompiled/CMakeLists.txt                 |   1 +
+ libprecompiled/Common.h                       |   1 +
+ libprecompiled/extension/CallVendorHE.cpp     | 515 ++++++++++++++++++
+ libprecompiled/extension/CallVendorHE.h       |  54 ++
+ .../extension/ChainAPIPrecompiled.cpp         | 417 ++++++++++++++
+ .../extension/ChainAPIPrecompiled.h           |  30 +
+ 9 files changed, 1032 insertions(+), 4 deletions(-)
+ create mode 100644 libprecompiled/extension/CallVendorHE.cpp
+ create mode 100644 libprecompiled/extension/CallVendorHE.h
+ create mode 100644 libprecompiled/extension/ChainAPIPrecompiled.cpp
+ create mode 100644 libprecompiled/extension/ChainAPIPrecompiled.h
+
+diff --git a/cmake/ProjectCryptopp.cmake b/cmake/ProjectCryptopp.cmake
+index a3b97e4..78048ac 100644
+--- a/cmake/ProjectCryptopp.cmake
++++ b/cmake/ProjectCryptopp.cmake
+@@ -142,8 +142,11 @@ ExternalProject_Add(cryptopp
+         -DCMAKE_POSITION_INDEPENDENT_CODE=${BUILD_SHARED_LIBS}
+         -DBUILD_SHARED=OFF
+         -DBUILD_TESTING=OFF
+-        -DCMAKE_C_FLAGS='${MARCH_TYPE}'
+-        -DCMAKE_CXX_FLAGS='${MARCH_TYPE}'
++        -DCMAKE_CXX_STANDARD=11
++        -DCMAKE_CXX_STANDARD_REQUIRED=ON
++        -DCMAKE_CXX_EXTENSIONS=OFF
++        -DCMAKE_C_FLAGS=
++        -DCMAKE_CXX_FLAGS=-std=gnu++11\ -fPIC\ -DCRYPTOPP_DISABLE_STD_BYTE
+         -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+         -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release
+diff --git a/cmake/ProjectRocksDB.cmake b/cmake/ProjectRocksDB.cmake
+index c513a2c..980297c 100644
+--- a/cmake/ProjectRocksDB.cmake
++++ b/cmake/ProjectRocksDB.cmake
+@@ -29,8 +29,13 @@ ExternalProject_Add(rocksdb
+     -DWITH_TOOLS=OFF
+     -DBUILD_SHARED_LIBS=OFF
+     -DUSE_RTTI=ON
+-    -DCMAKE_C_FLAGS='${MARCH_TYPE}'
+-    -DCMAKE_CXX_FLAGS='${MARCH_TYPE}'
++    -DCMAKE_C_STANDARD=99
++    -DCMAKE_C_STANDARD_REQUIRED=ON
++    -DCMAKE_CXX_STANDARD=11
++    -DCMAKE_CXX_STANDARD_REQUIRED=ON
++    -DCMAKE_CXX_EXTENSIONS=OFF
++    -DCMAKE_C_FLAGS=${MARCH_TYPE}
++    -DCMAKE_CXX_FLAGS=-std=c++11\ -pthread\ -fPIC\ ${MARCH_TYPE}
+     -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+     -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+     INSTALL_COMMAND ""
+diff --git a/cmake/templates/UserPrecompiled.h.in b/cmake/templates/UserPrecompiled.h.in
+index 2dd58e2..0c3438b 100644
+--- a/cmake/templates/UserPrecompiled.h.in
++++ b/cmake/templates/UserPrecompiled.h.in
+@@ -30,6 +30,8 @@
+     // Address should in [0x5001,0xffff]
+     // context->setAddress2Precompiled(Address(0x5001),
+     // std::make_shared<dev::precompiled::HelloWorldPrecompiled>());
++    context->setAddress2Precompiled(
++        Address(dev::precompiled::CHAIN_API_ADDRESS), std::make_shared<dev::precompiled::ChainAPIPrecompiled>());
+     context->setAddress2Precompiled(
+         Address(dev::precompiled::DAG_TRANSFER_ADDRESS), std::make_shared<dev::precompiled::DagTransferPrecompiled>());
+     context->setAddress2Precompiled(
+diff --git a/libprecompiled/CMakeLists.txt b/libprecompiled/CMakeLists.txt
+index 88d1e86..f2e4c38 100644
+--- a/libprecompiled/CMakeLists.txt
++++ b/libprecompiled/CMakeLists.txt
+@@ -5,4 +5,5 @@ add_library(precompiled ${SRC_LIST} ${HEADERS})
+ target_link_libraries(precompiled PRIVATE blockverifier ethcore)
+ target_link_libraries(precompiled PUBLIC storage devcore JsonCpp)
+ target_link_libraries(precompiled PRIVATE Paillier GroupSig VRF)
++target_link_libraries(precompiled PRIVATE ${CMAKE_DL_LIBS})
+ add_subdirectory(extension)
+diff --git a/libprecompiled/Common.h b/libprecompiled/Common.h
+index 87c0989..51aa510 100644
+--- a/libprecompiled/Common.h
++++ b/libprecompiled/Common.h
+@@ -220,6 +220,7 @@ const Address KVTABLE_FACTORY_ADDRESS = Address(0x1010);
+ const Address WORKING_SEALER_MGR_ADDRESS = Address(0x1011);
+ 
+ // crypto/extension precompiled contract address
++const Address CHAIN_API_ADDRESS = Address(0x5001);
+ const Address DAG_TRANSFER_ADDRESS = Address(0x5002);
+ const Address PAILLIER_ADDRESS = Address(0x5003);
+ const Address GROUP_SIG_ADDRESS = Address(0x5004);
+diff --git a/libprecompiled/extension/CallVendorHE.cpp b/libprecompiled/extension/CallVendorHE.cpp
+new file mode 100644
+index 0000000..d5444d9
+--- /dev/null
++++ b/libprecompiled/extension/CallVendorHE.cpp
+@@ -0,0 +1,515 @@
++#include "CallVendorHE.h"
++#include <boost/algorithm/string.hpp>
++#include <dlfcn.h>
++#include <libprecompiled/Common.h>
++#include <cstdlib>
++#include <mutex>
++
++namespace
++{
++enum ChainAPILogLevel
++{
++    LOG_LEVEL_TRACE = 0,
++    LOG_LEVEL_DEBUG = 1,
++    LOG_LEVEL_INFO = 2,
++    LOG_LEVEL_WARNING = 3,
++    LOG_LEVEL_ERROR = 4
++};
++
++ChainAPILogLevel chainAPILogLevel()
++{
++    static ChainAPILogLevel s_level = []() {
++        const char* configured = std::getenv("CHAIN_API_PRECOMPILED_LOG_LEVEL");
++        if (!configured)
++        {
++            return LOG_LEVEL_DEBUG;
++        }
++        std::string level = configured;
++        boost::to_upper(level);
++        if (level == "TRACE")
++        {
++            return LOG_LEVEL_TRACE;
++        }
++        if (level == "DEBUG")
++        {
++            return LOG_LEVEL_DEBUG;
++        }
++        if (level == "INFO")
++        {
++            return LOG_LEVEL_INFO;
++        }
++        if (level == "WARNING" || level == "WARN")
++        {
++            return LOG_LEVEL_WARNING;
++        }
++        if (level == "ERROR")
++        {
++            return LOG_LEVEL_ERROR;
++        }
++        return LOG_LEVEL_DEBUG;
++    }();
++    return s_level;
++}
++
++inline bool shouldLog(ChainAPILogLevel _expected) { return _expected >= chainAPILogLevel(); }
++
++template <typename T>
++T loadSym(void* handle, const char* name)
++{
++    dlerror();
++    void* sym = dlsym(handle, name);
++    const char* e = dlerror();
++    if (e || !sym)
++    {
++        return nullptr;
++    }
++    return reinterpret_cast<T>(sym);
++}
++}  // namespace
++
++struct CallVendorHE::Impl
++{
++    typedef int (*set_path_t)(const char*);
++    typedef int (*load_key_t)(const char*);
++    typedef int (*one_in_one_out_t)(const char*, char*, int);
++    typedef int (*two_in_one_out_t)(const char*, const char*, char*, int);
++    typedef int (*three_in_one_out_t)(const char*, const char*, const char*, char*, int);
++
++    void* soHandle = nullptr;
++    std::string basePath;
++    bool ready = false;
++    mutable std::mutex mutex;
++
++    set_path_t setPath = nullptr;
++    load_key_t loadSK = nullptr;
++    load_key_t loadPK = nullptr;
++    load_key_t loadDict = nullptr;
++
++    one_in_one_out_t encInt = nullptr;
++    one_in_one_out_t decInt = nullptr;
++    one_in_one_out_t encDouble = nullptr;
++    one_in_one_out_t decDouble = nullptr;
++    one_in_one_out_t encString = nullptr;
++    one_in_one_out_t decString = nullptr;
++
++    two_in_one_out_t addInt = nullptr;
++    two_in_one_out_t subInt = nullptr;
++    two_in_one_out_t addDouble = nullptr;
++    two_in_one_out_t subDouble = nullptr;
++    two_in_one_out_t mulDouble = nullptr;
++    two_in_one_out_t divDouble = nullptr;
++    two_in_one_out_t cmpDouble = nullptr;
++    two_in_one_out_t concatString = nullptr;
++
++    three_in_one_out_t substring = nullptr;
++    one_in_one_out_t length = nullptr;
++};
++
++namespace
++{
++inline CallVendorHE::Err mapRet(int ret)
++{
++    return (ret == 0) ? CallVendorHE::Err::OK : CallVendorHE::Err::CRYPTO_FAIL;
++}
++}  // namespace
++
++CallVendorHE::CallVendorHE() : m_impl(new Impl()) {}
++
++CallVendorHE::~CallVendorHE()
++{
++    if (m_impl && m_impl->soHandle)
++    {
++        dlclose(m_impl->soHandle);
++        m_impl->soHandle = nullptr;
++    }
++}
++
++CallVendorHE::Err CallVendorHE::initSo(const std::string& soPath)
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_INFO))
++    {
++        PRECOMPILED_LOG(INFO) << LOG_BADGE("CallVendorHE") << LOG_DESC("initSo")
++                              << LOG_KV("soPath", soPath)
++                              << LOG_KV("defaultLogLevel", "DEBUG");
++    }
++
++    if (m_impl->soHandle)
++    {
++        dlclose(m_impl->soHandle);
++        m_impl->soHandle = nullptr;
++        m_impl->ready = false;
++    }
++    m_impl->soHandle = dlopen(soPath.c_str(), RTLD_NOW | RTLD_LOCAL);
++    if (!m_impl->soHandle)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("dlopen failed")
++                               << LOG_KV("soPath", soPath);
++        return Err::SO_LOAD_FAIL;
++    }
++
++    // TODO: replace symbols with real vendor api names
++    m_impl->setPath = loadSym<Impl::set_path_t>(m_impl->soHandle, "VHE_SetFilePath");
++    m_impl->loadSK = loadSym<Impl::load_key_t>(m_impl->soHandle, "VHE_LoadSK");
++    m_impl->loadPK = loadSym<Impl::load_key_t>(m_impl->soHandle, "VHE_LoadPK");
++    m_impl->loadDict = loadSym<Impl::load_key_t>(m_impl->soHandle, "VHE_LoadDictionary");
++
++    m_impl->encInt = loadSym<Impl::one_in_one_out_t>(m_impl->soHandle, "VHE_EncryptPubInt");
++    m_impl->decInt = loadSym<Impl::one_in_one_out_t>(m_impl->soHandle, "VHE_DecryptInt");
++    m_impl->encDouble = loadSym<Impl::one_in_one_out_t>(m_impl->soHandle, "VHE_EncryptPubDouble");
++    m_impl->decDouble = loadSym<Impl::one_in_one_out_t>(m_impl->soHandle, "VHE_DecryptDouble");
++    m_impl->encString = loadSym<Impl::one_in_one_out_t>(m_impl->soHandle, "VHE_EncryptPubString");
++    m_impl->decString = loadSym<Impl::one_in_one_out_t>(m_impl->soHandle, "VHE_DecryptString");
++
++    m_impl->addInt = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_AddInt");
++    m_impl->subInt = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_SubstractInt");
++    m_impl->addDouble = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_AddDouble");
++    m_impl->subDouble = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_SubstractDouble");
++    m_impl->mulDouble = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_MultiplyDouble");
++    m_impl->divDouble = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_DivideDouble");
++    m_impl->cmpDouble = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_CompareDouble");
++    m_impl->concatString = loadSym<Impl::two_in_one_out_t>(m_impl->soHandle, "VHE_ConcatString");
++
++    m_impl->substring = loadSym<Impl::three_in_one_out_t>(m_impl->soHandle, "VHE_Substring");
++    m_impl->length = loadSym<Impl::one_in_one_out_t>(m_impl->soHandle, "VHE_Length");
++
++    if (!m_impl->setPath || !m_impl->loadSK || !m_impl->loadPK || !m_impl->loadDict ||
++        !m_impl->encInt || !m_impl->decInt || !m_impl->encDouble || !m_impl->decDouble ||
++        !m_impl->encString || !m_impl->decString || !m_impl->addInt || !m_impl->subInt ||
++        !m_impl->addDouble || !m_impl->subDouble || !m_impl->mulDouble || !m_impl->divDouble ||
++        !m_impl->cmpDouble || !m_impl->concatString || !m_impl->substring || !m_impl->length)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("dlsym incomplete");
++        return Err::SYM_LOAD_FAIL;
++    }
++
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("initSo success");
++    }
++    return Err::OK;
++}
++
++CallVendorHE::Err CallVendorHE::setFilePath(const std::string& path)
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (!m_impl->soHandle || !m_impl->setPath)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("setFilePath not init");
++        return Err::NOT_INIT;
++    }
++    if (path.empty())
++    {
++        return Err::BAD_PARAM;
++    }
++    if (m_impl->setPath(path.c_str()) != 0)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("set path failed")
++                               << LOG_KV("path", path);
++        return Err::IO_FAIL;
++    }
++    m_impl->basePath = path;
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("setFilePath done")
++                               << LOG_KV("path", path);
++    }
++    return Err::OK;
++}
++
++CallVendorHE::Err CallVendorHE::loadSK(const std::string& filename)
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (!m_impl->soHandle || !m_impl->loadSK)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadSK not init");
++        return Err::NOT_INIT;
++    }
++    if (filename.empty())
++    {
++        return Err::BAD_PARAM;
++    }
++    auto ret = mapRet(m_impl->loadSK((m_impl->basePath + filename).c_str()));
++    if (ret != Err::OK)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadSK failed")
++                               << LOG_KV("file", filename);
++    }
++    return ret;
++}
++
++CallVendorHE::Err CallVendorHE::loadPK(const std::string& filename)
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (!m_impl->soHandle || !m_impl->loadPK)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadPK not init");
++        return Err::NOT_INIT;
++    }
++    if (filename.empty())
++    {
++        return Err::BAD_PARAM;
++    }
++    auto ret = mapRet(m_impl->loadPK((m_impl->basePath + filename).c_str()));
++    if (ret != Err::OK)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadPK failed")
++                               << LOG_KV("file", filename);
++    }
++    return ret;
++}
++
++CallVendorHE::Err CallVendorHE::loadDictionary(const std::string& filename)
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (!m_impl->soHandle || !m_impl->loadDict)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadDictionary not init");
++        return Err::NOT_INIT;
++    }
++    if (filename.empty())
++    {
++        return Err::BAD_PARAM;
++    }
++    auto ret = mapRet(m_impl->loadDict((m_impl->basePath + filename).c_str()));
++    m_impl->ready = (ret == Err::OK);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("loadDictionary")
++                               << LOG_KV("file", filename) << LOG_KV("ready", m_impl->ready);
++    }
++    return ret;
++}
++
++static CallVendorHE::Err call1(const CallVendorHE::Impl* impl,
++    CallVendorHE::Impl::one_in_one_out_t fn, const std::string& input, std::string& out)
++{
++    if (!impl->soHandle || !impl->ready || !fn)
++    {
++        return CallVendorHE::Err::NOT_INIT;
++    }
++    if (input.empty())
++    {
++        return CallVendorHE::Err::BAD_PARAM;
++    }
++    char buf[65536] = {0};
++    auto ret = mapRet(fn(input.c_str(), buf, sizeof(buf)));
++    if (ret != CallVendorHE::Err::OK)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("call1 failed");
++        return ret;
++    }
++    out = std::string(buf);
++    return CallVendorHE::Err::OK;
++}
++
++static CallVendorHE::Err call2(const CallVendorHE::Impl* impl,
++    CallVendorHE::Impl::two_in_one_out_t fn, const std::string& a, const std::string& b,
++    std::string& out)
++{
++    if (!impl->soHandle || !impl->ready || !fn)
++    {
++        return CallVendorHE::Err::NOT_INIT;
++    }
++    if (a.empty() || b.empty())
++    {
++        return CallVendorHE::Err::BAD_PARAM;
++    }
++    char buf[65536] = {0};
++    auto ret = mapRet(fn(a.c_str(), b.c_str(), buf, sizeof(buf)));
++    if (ret != CallVendorHE::Err::OK)
++    {
++        PRECOMPILED_LOG(ERROR) << LOG_BADGE("CallVendorHE") << LOG_DESC("call2 failed");
++        return ret;
++    }
++    out = std::string(buf);
++    return CallVendorHE::Err::OK;
++}
++
++CallVendorHE::Err CallVendorHE::encryptPubInt(const std::string& in, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("encryptPubInt")
++                               << LOG_KV("input", in);
++    }
++    return call1(m_impl.get(), m_impl->encInt, in, out);
++}
++CallVendorHE::Err CallVendorHE::decryptInt(const std::string& in, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("decryptInt")
++                               << LOG_KV("input", in);
++    }
++    return call1(m_impl.get(), m_impl->decInt, in, out);
++}
++CallVendorHE::Err CallVendorHE::encryptPubDouble(const std::string& in, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("encryptPubDouble")
++                               << LOG_KV("input", in);
++    }
++    return call1(m_impl.get(), m_impl->encDouble, in, out);
++}
++CallVendorHE::Err CallVendorHE::decryptDouble(const std::string& in, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("decryptDouble")
++                               << LOG_KV("input", in);
++    }
++    return call1(m_impl.get(), m_impl->decDouble, in, out);
++}
++CallVendorHE::Err CallVendorHE::encryptPubString(const std::string& in, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("encryptPubString")
++                               << LOG_KV("input", in);
++    }
++    return call1(m_impl.get(), m_impl->encString, in, out);
++}
++CallVendorHE::Err CallVendorHE::decryptString(const std::string& in, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("decryptString")
++                               << LOG_KV("input", in);
++    }
++    return call1(m_impl.get(), m_impl->decString, in, out);
++}
++CallVendorHE::Err CallVendorHE::length(const std::string& data, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("length")
++                               << LOG_KV("input", data);
++    }
++    return call1(m_impl.get(), m_impl->length, data, out);
++}
++
++CallVendorHE::Err CallVendorHE::addInt(const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("addInt")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->addInt, a, b, out);
++}
++CallVendorHE::Err CallVendorHE::substractInt(
++    const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("substractInt")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->subInt, a, b, out);
++}
++CallVendorHE::Err CallVendorHE::addDouble(
++    const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("addDouble")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->addDouble, a, b, out);
++}
++CallVendorHE::Err CallVendorHE::substractDouble(
++    const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("substractDouble")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->subDouble, a, b, out);
++}
++CallVendorHE::Err CallVendorHE::multiplyDouble(
++    const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("multiplyDouble")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->mulDouble, a, b, out);
++}
++CallVendorHE::Err CallVendorHE::divideDouble(
++    const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("divideDouble")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->divDouble, a, b, out);
++}
++CallVendorHE::Err CallVendorHE::compareDouble(
++    const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("compareDouble")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->cmpDouble, a, b, out);
++}
++CallVendorHE::Err CallVendorHE::concatString(
++    const std::string& a, const std::string& b, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("concatString")
++                               << LOG_KV("a", a) << LOG_KV("b", b);
++    }
++    return call2(m_impl.get(), m_impl->concatString, a, b, out);
++}
++
++CallVendorHE::Err CallVendorHE::substring(
++    const std::string& data, const std::string& startIn, const std::string& endIn, std::string& out) const
++{
++    std::lock_guard<std::mutex> lock(m_impl->mutex);
++    if (shouldLog(LOG_LEVEL_DEBUG))
++    {
++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("CallVendorHE") << LOG_DESC("substring")
++                               << LOG_KV("data", data) << LOG_KV("start", startIn)
++                               << LOG_KV("end", endIn);
++    }
++    if (!m_impl->soHandle || !m_impl->ready || !m_impl->substring)
++    {
++        return Err::NOT_INIT;
++    }
++    if (data.empty())
++    {
++        return Err::BAD_PARAM;
++    }
++    char buf[65536] = {0};
++    auto ret = mapRet(m_impl->substring(data.c_str(), startIn.c_str(), endIn.c_str(), buf, sizeof(buf)));
++    if (ret != Err::OK)
++    {
++        return ret;
++    }
++    out = std::string(buf);
++    return Err::OK;
++}
++diff --git a/libprecompiled/extension/CallVendorHE.h b/libprecompiled/extension/CallVendorHE.h
++new file mode 100644
++index 0000000..e25d849
++--- /dev/null
+++++ b/libprecompiled/extension/CallVendorHE.h
++@@ -0,0 +1,54 @@
+++#pragma once
+++
+++#include <memory>
+++#include <string>
+++
+++class CallVendorHE
+++{
+++public:
+++    struct Impl;
+++
+++    enum class Err
+++    {
+++        OK = 0,
+++        NOT_INIT,
+++        SO_LOAD_FAIL,
+++        SYM_LOAD_FAIL,
+++        BAD_PARAM,
+++        CRYPTO_FAIL,
+++        IO_FAIL,
+++        INTERNAL
+++    };
+++
+++    CallVendorHE();
+++    ~CallVendorHE();
+++
+++    Err initSo(const std::string& soPath);
+++    Err setFilePath(const std::string& path);
+++    Err loadSK(const std::string& filename);
+++    Err loadPK(const std::string& filename);
+++    Err loadDictionary(const std::string& filename);
+++
+++    Err encryptPubInt(const std::string& in, std::string& out) const;
+++    Err decryptInt(const std::string& in, std::string& out) const;
+++    Err encryptPubDouble(const std::string& in, std::string& out) const;
+++    Err decryptDouble(const std::string& in, std::string& out) const;
+++    Err encryptPubString(const std::string& in, std::string& out) const;
+++    Err decryptString(const std::string& in, std::string& out) const;
+++
+++    Err addInt(const std::string& a, const std::string& b, std::string& out) const;
+++    Err substractInt(const std::string& a, const std::string& b, std::string& out) const;
+++    Err addDouble(const std::string& a, const std::string& b, std::string& out) const;
+++    Err substractDouble(const std::string& a, const std::string& b, std::string& out) const;
+++    Err multiplyDouble(const std::string& a, const std::string& b, std::string& out) const;
+++    Err divideDouble(const std::string& a, const std::string& b, std::string& out) const;
+++    Err compareDouble(const std::string& a, const std::string& b, std::string& out) const;
+++    Err concatString(const std::string& a, const std::string& b, std::string& out) const;
+++
+++    Err substring(
+++        const std::string& data, const std::string& startIn, const std::string& endIn, std::string& out) const;
+++    Err length(const std::string& data, std::string& out) const;
+++
+++private:
+++    std::unique_ptr<Impl> m_impl;
+++};
++diff --git a/libprecompiled/extension/ChainAPIPrecompiled.cpp b/libprecompiled/extension/ChainAPIPrecompiled.cpp
++new file mode 100644
++index 0000000..4e2a109
++--- /dev/null
+++++ b/libprecompiled/extension/ChainAPIPrecompiled.cpp
++@@ -0,0 +1,417 @@
+++#include "ChainAPIPrecompiled.h"
+++#include <boost/algorithm/string.hpp>
+++#include <libdevcore/Common.h>
+++#include <libethcore/ABI.h>
+++#include <cstdlib>
+++
+++using namespace dev;
+++using namespace dev::blockverifier;
+++using namespace dev::precompiled;
+++
+++const char* const CHAIN_API_GET = "get()";
+++const char* const CHAIN_API_SET = "set(string)";
+++const char* const CHAIN_API_V_SET_FILE_PATH = "VSetFilePath(string)";
+++const char* const CHAIN_API_V_LOAD_SK = "VLoadSK(string)";
+++const char* const CHAIN_API_V_LOAD_PK = "VLoadPK(string)";
+++const char* const CHAIN_API_V_LOAD_DICTIONARY = "VLoadDictionary(string)";
+++const char* const CHAIN_API_V_ENCRYPT_PUB_INT = "VEncryptPubInt(string)";
+++const char* const CHAIN_API_V_DECRYPT_INT = "VDecryptInt(string)";
+++const char* const CHAIN_API_V_ENCRYPT_PUB_DOUBLE = "VEncryptPubDouble(string)";
+++const char* const CHAIN_API_V_DECRYPT_DOUBLE = "VDecryptDouble(string)";
+++const char* const CHAIN_API_V_ENCRYPT_PUB_STRING = "VEncryptPubString(string)";
+++const char* const CHAIN_API_V_DECRYPT_STRING = "VDecryptString(string)";
+++const char* const CHAIN_API_V_ADD_INT = "VAddInt(string,string)";
+++const char* const CHAIN_API_V_SUBSTRACT_INT = "VSubstractInt(string,string)";
+++const char* const CHAIN_API_V_ADD_DOUBLE = "VAddDouble(string,string)";
+++const char* const CHAIN_API_V_SUBSTRACT_DOUBLE = "VSubstractDouble(string,string)";
+++const char* const CHAIN_API_V_MULTIPLY_DOUBLE = "VMultiplyDouble(string,string)";
+++const char* const CHAIN_API_V_DIVIDE_DOUBLE = "VDivideDouble(string,string)";
+++const char* const CHAIN_API_V_COMPARE_DOUBLE = "VCompareDouble(string,string)";
+++const char* const CHAIN_API_V_CONCAT_STRING = "VConcatString(string,string)";
+++const char* const CHAIN_API_V_SUBSTRING = "VSubstring(string,string,string)";
+++const char* const CHAIN_API_V_LENGTH = "VLength(string)";
+++
+++namespace
+++{
+++enum ChainAPILogLevel
+++{
+++    LOG_LEVEL_TRACE = 0,
+++    LOG_LEVEL_DEBUG = 1,
+++    LOG_LEVEL_INFO = 2,
+++    LOG_LEVEL_WARNING = 3,
+++    LOG_LEVEL_ERROR = 4
+++};
+++
+++ChainAPILogLevel chainAPILogLevel()
+++{
+++    static ChainAPILogLevel s_level = []() {
+++        const char* configured = std::getenv("CHAIN_API_PRECOMPILED_LOG_LEVEL");
+++        if (!configured)
+++        {
+++            return LOG_LEVEL_DEBUG;
+++        }
+++        std::string level = configured;
+++        boost::to_upper(level);
+++        if (level == "TRACE")
+++        {
+++            return LOG_LEVEL_TRACE;
+++        }
+++        if (level == "DEBUG")
+++        {
+++            return LOG_LEVEL_DEBUG;
+++        }
+++        if (level == "INFO")
+++        {
+++            return LOG_LEVEL_INFO;
+++        }
+++        if (level == "WARNING" || level == "WARN")
+++        {
+++            return LOG_LEVEL_WARNING;
+++        }
+++        if (level == "ERROR")
+++        {
+++            return LOG_LEVEL_ERROR;
+++        }
+++        return LOG_LEVEL_DEBUG;
+++    }();
+++    return s_level;
+++}
+++
+++inline bool shouldLog(ChainAPILogLevel _expected) { return _expected >= chainAPILogLevel(); }
+++
+++inline void setError(PrecompiledExecResult::Ptr const& _callResult, int _errorCode)
+++{
+++    getErrorCodeOut(_callResult->mutableExecResult(), _errorCode);
+++}
+++
+++inline int mapVendorError(CallVendorHE::Err e)
+++{
+++    switch (e)
+++    {
+++    case CallVendorHE::Err::OK:
+++        return 0;
+++    case CallVendorHE::Err::NOT_INIT:
+++        return -51610;
+++    case CallVendorHE::Err::SO_LOAD_FAIL:
+++        return -51611;
+++    case CallVendorHE::Err::SYM_LOAD_FAIL:
+++        return -51612;
+++    case CallVendorHE::Err::BAD_PARAM:
+++        return -51613;
+++    case CallVendorHE::Err::IO_FAIL:
+++        return -51614;
+++    case CallVendorHE::Err::CRYPTO_FAIL:
+++        return CODE_INVALID_CIPHERS;
+++    case CallVendorHE::Err::INTERNAL:
+++    default:
+++        return -51699;
+++    }
+++}
+++}  // namespace
+++
+++ChainAPIPrecompiled::ChainAPIPrecompiled() : m_vendor(std::make_shared<CallVendorHE>())
+++{
+++    if (shouldLog(LOG_LEVEL_INFO))
+++    {
+++        PRECOMPILED_LOG(INFO) << LOG_BADGE("ChainAPIPrecompiled")
+++                              << LOG_DESC("init")
+++                              << LOG_KV("defaultLogLevel", "DEBUG")
+++                              << LOG_KV("env", "CHAIN_API_PRECOMPILED_LOG_LEVEL");
+++    }
+++    auto regMethod = [this](const char* _method) {
+++        name2Selector[_method] = getFuncSelector(_method);
+++        if (shouldLog(LOG_LEVEL_DEBUG))
+++        {
+++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
+++                                   << LOG_DESC("register selector")
+++                                   << LOG_KV("method", _method)
+++                                   << LOG_KV("selector", name2Selector[_method]);
+++        }
+++    };
+++
+++    regMethod(CHAIN_API_GET);
+++    regMethod(CHAIN_API_SET);
+++    regMethod(CHAIN_API_V_SET_FILE_PATH);
+++    regMethod(CHAIN_API_V_LOAD_SK);
+++    regMethod(CHAIN_API_V_LOAD_PK);
+++    regMethod(CHAIN_API_V_LOAD_DICTIONARY);
+++    regMethod(CHAIN_API_V_ENCRYPT_PUB_INT);
+++    regMethod(CHAIN_API_V_DECRYPT_INT);
+++    regMethod(CHAIN_API_V_ENCRYPT_PUB_DOUBLE);
+++    regMethod(CHAIN_API_V_DECRYPT_DOUBLE);
+++    regMethod(CHAIN_API_V_ENCRYPT_PUB_STRING);
+++    regMethod(CHAIN_API_V_DECRYPT_STRING);
+++    regMethod(CHAIN_API_V_ADD_INT);
+++    regMethod(CHAIN_API_V_SUBSTRACT_INT);
+++    regMethod(CHAIN_API_V_ADD_DOUBLE);
+++    regMethod(CHAIN_API_V_SUBSTRACT_DOUBLE);
+++    regMethod(CHAIN_API_V_MULTIPLY_DOUBLE);
+++    regMethod(CHAIN_API_V_DIVIDE_DOUBLE);
+++    regMethod(CHAIN_API_V_COMPARE_DOUBLE);
+++    regMethod(CHAIN_API_V_CONCAT_STRING);
+++    regMethod(CHAIN_API_V_SUBSTRING);
+++    regMethod(CHAIN_API_V_LENGTH);
+++}
+++
+++PrecompiledExecResult::Ptr ChainAPIPrecompiled::call(
+++    ExecutiveContext::Ptr, bytesConstRef _param, Address const&, Address const&)
+++{
+++    if (shouldLog(LOG_LEVEL_DEBUG))
+++    {
+++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled") << LOG_DESC("call")
+++                               << LOG_KV("paramSize", _param.size()) << LOG_KV("param", toHex(_param));
+++    }
+++
+++    auto callResult = m_precompiledExecResultFactory->createPrecompiledResult();
+++    callResult->gasPricer()->setMemUsed(_param.size());
+++
+++    auto func = getParamFunc(_param);
+++    auto data = getParamData(_param);
+++    dev::eth::ContractABI abi;
+++    if (shouldLog(LOG_LEVEL_DEBUG))
+++    {
+++        PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled") << LOG_DESC("dispatch")
+++                               << LOG_KV("selector", func) << LOG_KV("dataSize", data.size());
+++    }
+++
+++    if (func == name2Selector[CHAIN_API_GET])
+++    {
+++        if (shouldLog(LOG_LEVEL_DEBUG))
+++        {
+++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled") << LOG_DESC("execute get")
+++                                   << LOG_KV("version", m_version);
+++        }
+++        callResult->setExecResult(abi.abiIn("", m_version));
+++        return callResult;
+++    }
+++    if (func == name2Selector[CHAIN_API_SET])
+++    {
+++        std::string version;
+++        abi.abiOut(data, version);
+++        if (shouldLog(LOG_LEVEL_DEBUG))
+++        {
+++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled") << LOG_DESC("execute set")
+++                                   << LOG_KV("newVersion", version);
+++        }
+++        m_version = version;
+++        setError(callResult, 0);
+++        return callResult;
+++    }
+++
+++    if (func == name2Selector[CHAIN_API_V_SET_FILE_PATH])
+++    {
++        std::string path;
++        abi.abiOut(data, path);
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("execute VSetFilePath") << LOG_KV("path", path);
++        }
++        setError(callResult, mapVendorError(m_vendor->setFilePath(path)));
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_LOAD_SK])
++    {
++        std::string file;
++        abi.abiOut(data, file);
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("execute VLoadSK") << LOG_KV("file", file);
++        }
++        setError(callResult, mapVendorError(m_vendor->loadSK(file)));
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_LOAD_PK])
++    {
++        std::string file;
++        abi.abiOut(data, file);
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("execute VLoadPK") << LOG_KV("file", file);
++        }
++        setError(callResult, mapVendorError(m_vendor->loadPK(file)));
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_LOAD_DICTIONARY])
++    {
++        std::string file;
++        abi.abiOut(data, file);
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("execute VLoadDictionary") << LOG_KV("file", file);
++        }
++        setError(callResult, mapVendorError(m_vendor->loadDictionary(file)));
++        return callResult;
++    }
++
++    auto call1 = [&](CallVendorHE::Err (CallVendorHE::*fn)(const std::string&, std::string&) const) {
++        std::string input;
++        std::string output;
++        abi.abiOut(data, input);
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("execute unary method") << LOG_KV("input", input);
++        }
++        auto error = (m_vendor.get()->*fn)(input, output);
++        if (error != CallVendorHE::Err::OK)
++        {
++            PRECOMPILED_LOG(ERROR) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("unary method failed")
++                                   << LOG_KV("error", static_cast<int>(error));
++            setError(callResult, mapVendorError(error));
++            return;
++        }
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("unary method done") << LOG_KV("output", output);
++        }
++        callResult->setExecResult(abi.abiIn("", output));
++    };
++
++    auto call2 = [&](CallVendorHE::Err (CallVendorHE::*fn)(
++                     const std::string&, const std::string&, std::string&) const) {
++        std::string a;
++        std::string b;
++        std::string output;
++        abi.abiOut(data, a, b);
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("execute binary method")
++                                   << LOG_KV("left", a) << LOG_KV("right", b);
++        }
++        auto error = (m_vendor.get()->*fn)(a, b, output);
++        if (error != CallVendorHE::Err::OK)
++        {
++            PRECOMPILED_LOG(ERROR) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("binary method failed")
++                                   << LOG_KV("error", static_cast<int>(error));
++            setError(callResult, mapVendorError(error));
++            return;
++        }
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("binary method done") << LOG_KV("output", output);
++        }
++        callResult->setExecResult(abi.abiIn("", output));
++    };
++
++    if (func == name2Selector[CHAIN_API_V_ENCRYPT_PUB_INT])
++    {
++        call1(&CallVendorHE::encryptPubInt);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_DECRYPT_INT])
++    {
++        call1(&CallVendorHE::decryptInt);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_ENCRYPT_PUB_DOUBLE])
++    {
++        call1(&CallVendorHE::encryptPubDouble);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_DECRYPT_DOUBLE])
++    {
++        call1(&CallVendorHE::decryptDouble);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_ENCRYPT_PUB_STRING])
++    {
++        call1(&CallVendorHE::encryptPubString);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_DECRYPT_STRING])
++    {
++        call1(&CallVendorHE::decryptString);
++        return callResult;
++    }
++
++    if (func == name2Selector[CHAIN_API_V_ADD_INT])
++    {
++        call2(&CallVendorHE::addInt);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_SUBSTRACT_INT])
++    {
++        call2(&CallVendorHE::substractInt);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_ADD_DOUBLE])
++    {
++        call2(&CallVendorHE::addDouble);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_SUBSTRACT_DOUBLE])
++    {
++        call2(&CallVendorHE::substractDouble);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_MULTIPLY_DOUBLE])
++    {
++        call2(&CallVendorHE::multiplyDouble);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_DIVIDE_DOUBLE])
++    {
++        call2(&CallVendorHE::divideDouble);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_COMPARE_DOUBLE])
++    {
++        call2(&CallVendorHE::compareDouble);
++        return callResult;
++    }
++    if (func == name2Selector[CHAIN_API_V_CONCAT_STRING])
++    {
++        call2(&CallVendorHE::concatString);
++        return callResult;
++    }
++
++    if (func == name2Selector[CHAIN_API_V_SUBSTRING])
++    {
++        std::string source;
++        std::string start;
++        std::string end;
++        std::string output;
++        abi.abiOut(data, source, start, end);
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("execute VSubstring")
++                                   << LOG_KV("source", source)
++                                   << LOG_KV("start", start)
++                                   << LOG_KV("end", end);
++        }
++        auto error = m_vendor->substring(source, start, end, output);
++        if (error != CallVendorHE::Err::OK)
++        {
++            setError(callResult, mapVendorError(error));
++            return callResult;
++        }
++        callResult->setExecResult(abi.abiIn("", output));
++        if (shouldLog(LOG_LEVEL_DEBUG))
++        {
++            PRECOMPILED_LOG(DEBUG) << LOG_BADGE("ChainAPIPrecompiled")
++                                   << LOG_DESC("VSubstring done") << LOG_KV("output", output);
++        }
++        return callResult;
++    }
++
++    if (func == name2Selector[CHAIN_API_V_LENGTH])
++    {
++        call1(&CallVendorHE::length);
++        return callResult;
++    }
++
++    PRECOMPILED_LOG(ERROR) << LOG_BADGE("ChainAPIPrecompiled") << LOG_DESC("unknown function")
++                           << LOG_KV("selector", func);
++    setError(callResult, CODE_UNKNOW_FUNCTION_CALL);
++    return callResult;
++}
++diff --git a/libprecompiled/extension/ChainAPIPrecompiled.h b/libprecompiled/extension/ChainAPIPrecompiled.h
++new file mode 100644
++index 0000000..4165b02
++--- /dev/null
+++++ b/libprecompiled/extension/ChainAPIPrecompiled.h
++@@ -0,0 +1,30 @@
+++#pragma once
+++
+++#include "CallVendorHE.h"
+++#include <libblockverifier/ExecutiveContext.h>
+++#include <libprecompiled/Common.h>
+++#include <memory>
+++#include <string>
+++
+++namespace dev
+++{
+++namespace precompiled
+++{
+++class ChainAPIPrecompiled : public dev::precompiled::Precompiled
+++{
+++public:
+++    typedef std::shared_ptr<ChainAPIPrecompiled> Ptr;
+++    ChainAPIPrecompiled();
+++    ~ChainAPIPrecompiled() override = default;
+++
+++    PrecompiledExecResult::Ptr call(std::shared_ptr<dev::blockverifier::ExecutiveContext> context,
+++        bytesConstRef param, Address const& origin = Address(),
+++        Address const& sender = Address()) override;
+++
+++private:
+++    std::shared_ptr<CallVendorHE> m_vendor;
+++    std::string m_version = "ChainAPI-HE-1.0";
+++};
+++
+++}  // namespace precompiled
+++}  // namespace dev
++-- 
++2.43.0
